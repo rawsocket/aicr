@@ -44,6 +44,25 @@ spec:
           value: ">= 450"            # GB/s
 ```
 
+**Declared checks are resolved fail-closed.** Before the cluster is
+prepared or any Job runs, `Validator.preflightDeclaredChecks`
+(`pkg/validator/validator.go`) rejects the run with `ErrCodeInvalidRequest`
+if any declared check name does not resolve to exactly one catalog validator
+in its declared phase — a name matching nothing (typo or a check missing from
+the loaded, possibly `--data`, catalog), a name that exists only under a
+different phase (`nccl-all-reduce-bw` declared under `deployment`), or a name
+declared more than once in one phase's `checks` list. All offenders across
+every requested phase are aggregated into a single error. This closes the
+fail-open path where an all-unmatched phase silently filtered to zero tests →
+`skipped` → nonblocking, letting `aicr validate --fail-on-error` exit `0` on a
+recipe whose required gate the catalog cannot supply
+([#2121](https://github.com/NVIDIA/aicr/issues/2121)). The gate runs in
+`--no-cluster` mode too, so typos are caught in offline recipe validation.
+There is no opt-out: a declared name that resolves nowhere is always an
+authoring error. A check that is *legitimately* not applicable at runtime
+reports its own `skip` sentinel from inside the container — it is still
+declared and still resolves to a catalog entry.
+
 Top-level `constraints` — and any declared under
 `validation.readiness.constraints` — are evaluated as a **pre-flight
 gate** before phase checks run; other phases' `constraints` are
@@ -214,6 +233,66 @@ validators.Run(map[string]validators.CheckFunc{
 | **stderr** | Streamed live to the user — use `slog.*` |
 | `/dev/termination-log` | Failure reason (≤ 4096 bytes), written on `return error` |
 | **stdout sentinel lines** | Structured/side-channel data — see [Stdout sentinels](#stdout-sentinels) |
+
+### Capability applicability contract
+
+A capability-gated conformance/performance check probes a live prerequisite
+(a Deployment, CRD, served API group, or non-empty list) before it runs, and
+turns that probe outcome into a verdict via `Capability.Require`
+(`validators/applicability.go`). A `Skip` (exit 2) is a claim that the
+capability is genuinely **inapplicable** — not a way to paper over a missing
+prerequisite or an infrastructure error. The dividing line is whether the
+resolved recipe *declares* the component that supplies the capability:
+`RecipeDeclares(ctx, component)` reports true only when that componentRef is
+present **and** enabled in `ctx.ValidationInput`.
+
+`Require(ctx, probeErr, present)` resolves the fate from the probe outcome.
+`present` is consulted only on a clean read (`probeErr == nil`) — e.g. a `List`
+that returned zero items or a discovery call that did not serve the expected
+group. Probe errors are classified by `classifyCapabilityProbeError`:
+
+| Probe outcome | recipe DECLARES | recipe does NOT declare |
+|---------------|-----------------|-------------------------|
+| clean read, present | `nil` (proceed) | `nil` (proceed) |
+| clean read, absent / empty | **FAIL** (`ErrCodeNotFound`) | **Skip** |
+| probe err: `NotFound` (incl. group-not-served) | **FAIL** (`ErrCodeNotFound`) | **Skip** |
+| probe err: `Forbidden` / `Unauthorized` (401/403) | **FAIL** (`ErrCodeUnauthorized`) — always | **FAIL** (`ErrCodeUnauthorized`) — always |
+| probe err: timeout / deadline | **FAIL** (`ErrCodeTimeout`) — always | **FAIL** (`ErrCodeTimeout`) — always |
+| probe err: transport (503 / conn reset / refused / HTTP2 lost) | **FAIL** (`ErrCodeUnavailable`) — always | **FAIL** (`ErrCodeUnavailable`) — always |
+| probe err: other / aggregated API discovery | **FAIL** (`ErrCodeInternal`) — always | **FAIL** (`ErrCodeInternal`) — always |
+
+**Infrastructure errors never Skip**, even when the recipe does not declare the
+component: a missing RBAC grant, an apiserver timeout, a dropped connection, or
+an aggregated discovery failure is not evidence that the capability is
+inapplicable — it is evidence the validator *could not tell*, which must block
+the gate. Only a clean `NotFound` / empty result on a **non-declared**
+capability is Skip-eligible. (A `Forbidden` on a declared dependency maps to
+`ErrCodeUnauthorized` rather than `ErrCodeInternal` precisely so operators read
+"the validator cannot see it — grant it RBAC," not a blanket internal error.)
+
+**Collection/list probes use `RequireList`.** When the probe is a `List` whose
+*empty result* (not an error) is what signals inapplicability — e.g.
+`detectPlatform` reading `Nodes().List` to classify the cloud — the caller passes
+the List error through `Capability.RequireList(err)` instead of `Require`. A List
+*error* is never Skip-eligible: even the rare `NotFound` shape on a collection
+endpoint is an apiserver/aggregation-layer anomaly, not the clean absence of a
+single object, so every List error blocks with a classified code and never a
+Skip. The empty-result inapplicability case is handled by the caller
+(`len(items) == 0`), keeping `Require`'s Skip path off the error branch entirely.
+
+**#1327 standalone boundary.** A standalone validator run carries no recipe
+context: `pkg/validator/v1.ToValidationInput` leaves `ComponentRefs` empty, so
+`RecipeDeclares` returns false (it is nil-safe on a nil `Context` or nil
+`ValidationInput`). On that path a clean-absent probe still `Skip`s, which
+preserves the capability-driven automatic selection that #1327 introduced.
+Fail-closed fires **only once the recipe actually declares** the dependency —
+declaration is what converts "inapplicable, so Skip" into "promised but missing,
+so fail."
+
+This closes the #2122 false-PASS: before this contract, a recipe that declared a
+capability whose prerequisite was absent — or whose probe hit an auth/timeout/
+transport/discovery error — reported `passed` (via a Skip that read as
+non-blocking), letting a broken or unauthorized cluster clear conformance.
 
 ### Stdout sentinels
 

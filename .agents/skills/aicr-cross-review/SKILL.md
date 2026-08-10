@@ -16,7 +16,7 @@ user-invocable: true
 # automatic path that removing the explicit nested call did not.
 disallowed-tools: Skill
 argument-hint: "<PR-number-or-URL>"
-version: 0.3.19
+version: 0.3.21
 ---
 
 # AICR Cross-Review: Multi-Agent PR Review with Consensus
@@ -226,7 +226,10 @@ the consensus mechanics):
 
 - **Review** — Claude Code (reviews the pinned diff directly; it deliberately does
   *not* delegate to the `code-review` command, whose step 8 instructs its agent to
-  `gh pr comment` the result back to the PR), Codex (background dispatch, a 9-min
+  `gh pr comment` the result back to the PR), Codex (two chained agents: a dispatch
+  agent starts the remote background job and hands back its id, which the workflow
+  immediately writes to the progress log — `Codex job <id> dispatched — review running
+  remotely` — then a wait agent runs a 9-min
   bounded wait plus up to four continuation waits when the job is still running — about 45 min
   for a live job), CodeRabbit (CLI against a detached worktree at `HEAD_SHA`, explicit
   600000 ms timeout — the Bash tool caps any single call at 10 minutes, which is why
@@ -356,8 +359,21 @@ the consensus mechanics):
 - If it dies mid-run, **resume, don't restart**:
   `Workflow({scriptPath: ..., resumeFromRunId: "<wf_...>"})` — completed lanes replay
   from cache. Empty or odd result → read `<transcriptDir>/journal.jsonl` first.
-- The Codex lane fails in three distinct ways, and the dispatch protocol treats them
-  differently:
+- **The Codex round-1 lane is two agents, deliberately.** A dispatch agent composes the
+  lean Codex task, starts the background job (and owns the fast-transient retry-once
+  rule, decided inside a brief ~90-second launch watch that exactly covers the
+  under-60s retry window), and returns `{jobId, dispatchNote}`; the workflow then logs
+  `Codex job <id> dispatched — review running remotely` and hands the id to a wait
+  agent that runs the continuation-wait protocol unchanged and translates the result.
+  The split exists for progress visibility: a single opaque agent call shows "running"
+  from spawn, which cannot distinguish "remote job dispatched and working" from
+  "dispatch never happened" — a real run sat silent for 19 minutes with no way to tell
+  which. The logged job id is the visible "started" signal, and it doubles as the
+  recovery handle when everything after dispatch dies: a dispatch-agent failure or a
+  wait-agent loss surfaces exactly like any Codex-lane unavailability (`incomplete`,
+  with `codexJobId` whenever a live job id exists). The wait agent never dispatches.
+- The Codex lane fails in three distinct ways, and the dispatch and wait protocols
+  treat them differently:
   - **Lookup miss** — the status call exits 1 with empty stdout and `No job found` on
     stderr. Companion state is keyed by workspace root and each Bash call is a fresh
     shell, so an unpinned lookup resolves to a different workspace and reports a live job
@@ -373,7 +389,8 @@ the consensus mechanics):
     a pinned recheck has also missed, return `unavailable` saying the job could not be
     located — never re-dispatch (the original may still be running) and never record it as
     exhausted budget.
-  - **Fast transient failure** — retried **once**, and only when all three hold:
+  - **Fast transient failure** — retried **once**, in the dispatch agent's launch
+    watch (the wait agent never dispatches), and only when all three hold:
     `.job.status` is `failed` (never `cancelled`), the job died in **under 60 seconds**
     by its own timestamps, and the error names a known-retryable cause such as an upstream
     capacity rejection (`Selected model is at capacity`) or a transient dispatch fault.
@@ -416,21 +433,62 @@ the consensus mechanics):
   it was waiting on (`jobId`), so even that kill stays resumable.
 - Codex is required, so a lane that is still unavailable after its retry makes the run
   report `incomplete`; re-run rather than interpreting a partial result.
-- **`incomplete` with a `codexJobId` means the review is NOT lost.** That field is the
-  live Codex job that outlasted the wait budget, surfaced top-level (alongside
-  `reviewerStatus`) precisely so recovery is mechanical, not improvised. Poll the job
+- **`incomplete` with a `codexJobId` usually means the review is NOT lost.** That field
+  is the Codex job the run was waiting on, surfaced top-level (alongside
+  `reviewerStatus`) precisely so recovery is mechanical, not improvised. The lane
+  attaches it to every unavailable wait result deliberately — losing a live id costs a
+  whole review, a wasted resume costs minutes — so it can also reference a job that
+  already failed or was cancelled: a poll that shows a terminal non-completed state, or
+  a resume that comes back unavailable again, confirms the job is dead and the review
+  must be re-run rather than resumed. For a live job: poll it
   with the companion status command until it is terminal (a background 60-second loop is
   fine — polling is cheap once the workflow is no longer holding a lane open for it),
   then resume: `Workflow({scriptPath, resumeFromRunId: "<wf_...>", args: {...prevArgs,
   codexResumeJobId: "<job id>"}})` — `prevArgs` is the previous run's args object, unchanged. The three completed lanes replay from cache, the
-  Codex lane fetches the existing job's result without dispatching a second one, and the
-  run proceeds to cross-review and verification normally. Proven live on PR 2097: a
+  Codex dispatch agent is skipped entirely (the workflow logs
+  `Codex resume: waiting on existing job <id>`), the wait agent collects the existing
+  job without dispatching a second one, and the
+  run proceeds to cross-review and verification normally. A run interrupted *between*
+  dispatch and result needs no `codexResumeJobId` at all: on `resumeFromRunId` the
+  dispatch agent's cached `{jobId}` replays instantly, so the wait prompt is
+  byte-identical to the original run's and the resume lands in the same wait with no
+  re-dispatch. Proven live on PR 2097: a
   ~53-minute job outlasted the then-three-wait budget, and the resumed run recovered it
   with zero re-dispatched work.
+- **A dead job from broker teardown needs a private-broker resume, not a plain one.**
+  When a Codex lane reports the job killed by concurrent-session broker teardown
+  (`statusNote` names infra-kill-by-concurrent-session-teardown — the confirmed
+  `sessionRuntime` fingerprint, which W2 and W4 both run; a late `failed` with a
+  reaper/null error is a symptom, not the gate, and an UNCONFIRMED cause gets an
+  ordinary re-run under the shared broker instead), the job is terminal — there is
+  nothing to poll and `codexResumeJobId` does not apply. A plain `resumeFromRunId`
+  does not help either: the lane *completed* with its unavailable result, so the
+  cache replays the failure verbatim. And a re-dispatch under the same shared broker
+  (keyed to the repo path) faces the same teardown risk while the concurrent sessions
+  that caused it are still running. The remedy: copy `scripts/workflow.mjs` to a
+  scratch path (never edit the checked-in file), add a one-line nonce to the affected
+  lane's prompt, and in the scratch copy replace `${repoPath}` with the
+  session-private worktree path in that lane's `--cwd` interpolations — every
+  companion command: dispatch, status, result. Edit the interpolation itself, not an
+  appended prompt override: the generated prompt's literal commands pin
+  `--cwd "${repoPath}"` and insist on it for every call, so an override that
+  contradicts them may lose, and any call that keeps the shared path lands the
+  recovered job back under the broker being torn down. Then
+  `Workflow({scriptPath: "<scratch copy>", resumeFromRunId:
+  "<wf_...>", args: prevArgs})`. Every other lane replays from cache; only the edited
+  lane re-runs, and its job lives under a private workspace broker that no concurrent
+  session's SessionEnd hook will tear down. The task prompt's pinned `git -C` reads
+  still name the original repo path, so the review context is unchanged. Proven live
+  2026-08-08 on PR 2097: two evaluation jobs died to teardown under the shared broker;
+  the third, dispatched under a private broker, completed and the run reached
+  consensus with zero re-reviewed lanes.
 - **Execute the CodeRabbit lane's STEP blocks verbatim** — same commands and paths, no
   substitutions; in particular never swap the `find … -delete` cleanup for `rm` (an
   invented `rm -rf` cleanup once blocked a run for hours on a managed-policy
-  confirmation prompt).
+  confirmation prompt). The no-`rm` rule covers **every** command composed in the lane,
+  ad-hoc diagnostics included — a self-written `.git/worktrees` writability probe with
+  `rm -f` cleanup once blocked a round the same way. `rmdir` for empty dirs,
+  `find <path> -maxdepth 0 -delete` for files, always.
 - CodeRabbit slow runs: check the newest file in `~/.coderabbit/logs/` (429/queue lines
   mean cloud-side queueing) and confirm `which -a coderabbit` resolves to the
   brew-managed binary — a stale `~/.local/bin` copy shadows it.
@@ -635,10 +693,27 @@ findings; omit the section if empty>
 **Default: do NOT post.** Present the full report in chat and stop. Do not ask
 whether to post.
 
-**Only when explicitly asked to post:** write the filtered summary to a file with the
-Write tool, then post it with `--body-file`. Never interpolate the report into a
-double-quoted shell argument — findings quote PR content, and backticks or `$(...)` in
-a finding would be executed by the shell before `gh` ever runs:
+**Only when explicitly asked to post**, publish two layers — one **brief** summary
+comment first, then one inline comment per finding that anchors to a changed line.
+The detail lives inline; the summary is an index, not a second copy.
+
+**Classify anchors before posting anything.** A finding is anchorable when its
+`path` is among the PR's changed files and its `line` falls inside the head commit's
+diff hunks (check against the pinned diff from Phase 1, not the mutable working
+copy). This classification decides where each finding's full text goes: anchorable →
+its inline comment; unanchorable → the summary, which is the only place it will
+appear.
+
+**1. Summary comment (first, brief).** The overview a reader sees before the diff:
+which commit was reviewed, a short overall assessment, and how many findings follow
+as inline comments — **do not list or index the individual findings here**; the
+inline comments are the findings. The only finding text that belongs in the summary
+is the **full text of an unanchorable finding** (and any open questions, which have
+no code anchor), since the summary is the only place those will appear.
+Write it to a file with the Write tool, then post with `--body-file`. Never
+interpolate the report into a double-quoted shell argument — findings quote PR
+content, and backticks or `$(...)` in a finding would be executed by the shell
+before `gh` ever runs:
 
 ```bash
 gh pr comment <n> --repo NVIDIA/aicr --body-file "<report-file>"
@@ -647,11 +722,44 @@ gh pr comment <n> --repo NVIDIA/aicr --body-file "<report-file>"
 `<report-file>` is the exact path you passed to Write — a Write-tool call cannot export
 a shell variable, so substitute the literal path here.
 
+**2. Inline comments — one per anchorable finding, full detail.** Each carries
+exactly one finding: the defect statement, the failure scenario, and the evidence
+`path:line`. Post each one as its own call — per-finding, so one rejected anchor
+cannot take down the rest. The whole payload goes through a file for quoting safety:
+`path` names a changed file in the PR under review and `line` comes from reviewer
+output, so both are PR-controlled — a path containing `$(...)` or backticks would
+execute if interpolated into shell source. Write the payload as JSON with the Write
+tool (require `line` to be a plain integer — reject anything else) and pass it with
+`--input`, so no finding-controlled value ever appears in the command line:
+
+```json
+{"body": "<finding text>", "commit_id": "<HEAD_SHA>",
+ "path": "<path>", "line": <line>, "side": "RIGHT"}
+```
+
+```bash
+gh api repos/NVIDIA/aicr/pulls/<n>/comments --input "<payload-file>"
+```
+
+If a call is rejected despite the pre-classification (the head moved between
+classification and post, a renamed path), do NOT re-anchor to a nearby line — a
+comment on the wrong line reads as a claim about that line. That finding's summary
+entry is now its only trace, so append the full finding text to the summary comment
+(`gh api --method PATCH repos/NVIDIA/aicr/issues/comments/<summary-comment-id>
+--input <payload-file>` with the updated body; capture the summary comment's id when
+posting it) so no finding is left as a bare one-liner.
+
+**Content rules for everything posted (summary and inline):**
+
 - Post **issues only**: Confirmed Issues (without the "Confirmed By" column),
   confirmed Integration Findings, Contested Issues, Unresolved, Open Questions.
-- **No reviewer-agent attribution and no severity-label prefixes** in posted
-  content. State each finding and its evidence plainly.
-- Never post Dismissed Findings or Positive Observations.
+  Never post Dismissed Findings or Positive Observations.
+- **The multi-agent machinery must be invisible in posted text.** Write as one
+  reviewer's plain findings: never use the words "cross-review", "review agent",
+  "reviewer", "consensus", "lane", "adversarial", "verification round", or any
+  agent name (Claude, Codex, CodeRabbit), and no severity-label prefixes or
+  vote/attribution columns. State each finding and its evidence plainly. The
+  machinery vocabulary belongs to the chat report only.
 
 ## Rules
 
@@ -690,7 +798,7 @@ a shell variable, so substitute the literal path here.
 - **The tool shell is zsh, and every prompt that hands out a shell command says so.**
   `scripts/workflow.mjs` defines a single `SHELL_CONTRACT` constant, interpolated in
   **exactly one place** — `NO_EXECUTION`, which every prompt builder composes exactly
-  once. So all six assembled prompts carry it exactly once. Do not add a second
+  once. So all seven assembled prompts carry it exactly once. Do not add a second
   interpolation: `NO_EXECUTION` already embeds `PINNED_READS`, so putting it in
   `PINNED_READS` or `CODEX_LEAN` as well silently doubles it in every lane. That is how
   the first attempt got it wrong, and no block-level check can see it — the duplication

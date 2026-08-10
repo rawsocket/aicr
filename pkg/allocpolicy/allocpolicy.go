@@ -68,6 +68,10 @@ const (
 	// disable gpu-operator and carry this instead; its values pin
 	// devicePlugin.enabled the same way.
 	ComponentGPUOperatorOCP = "gpu-operator-ocp"
+	// ComponentDRADriverOCP is the OpenShift DRA driver: OCP recipes
+	// disable nvidia-dra-driver-gpu and carry this instead; its values
+	// pin resources.gpus.enabled the same way (same chart, reused).
+	ComponentDRADriverOCP = "nvidia-dra-driver-gpu-ocp"
 
 	// PathDRAGPUsEnabled is the DRA driver's full-GPU allocation switch.
 	PathDRAGPUsEnabled = "resources.gpus.enabled"
@@ -100,6 +104,9 @@ func Descriptor() []Entry {
 		{Component: ComponentGPUOperator, SelectorPaths: []string{PathDevicePluginEnabled}},
 		{Component: ComponentGPUOperatorOCP, SelectorPaths: []string{PathDevicePluginEnabled}},
 		{Component: ComponentDRADriver, SelectorPaths: []string{
+			PathDRAGPUsEnabledOverride, PathDRAGPUsEnabled,
+		}},
+		{Component: ComponentDRADriverOCP, SelectorPaths: []string{
 			PathDRAGPUsEnabledOverride, PathDRAGPUsEnabled,
 		}},
 	}
@@ -158,9 +165,13 @@ type Observation struct {
 // CheckCoherence is the single shared evaluator of the #1327 tuple-coherence
 // rules for every advertiser shape, failing closed (ErrCodeInvalidRequest).
 // The hydrating artifact gate (pkg/recipe) and the validation-time resolver
-// (pkg/validator/v1 ResolveGPUAllocationPolicy) both delegate their verdicts
-// here, so an artifact the gate emits is exactly an artifact validation
-// accepts — gate/resolver symmetry (ADR-015).
+// (pkg/validator/v1 ResolveGPUAllocationPolicy) both delegate their tuple
+// verdicts here, so over these #1327 tuple rows an artifact the gate emits is
+// exactly an artifact validation accepts — gate/resolver symmetry (ADR-015).
+// The #1685 dual-operator rejection is resolution-time-only and deliberately
+// not part of this evaluator: it is a resolver-side check on the recipe's
+// component set, not a tuple reading, and bundle-time rejection is a separate
+// follow-up.
 //
 // Under a declared external advertiser (ADR-015 GKE amendment), the external
 // plugin is THE advertiser in the exactly-one invariant:

@@ -160,7 +160,7 @@ aicr snapshot \
 aicr snapshot \
   --kubeconfig ~/.kube/config \
   --namespace gpu-operator \
-  --image ghcr.io/nvidia/aicr:v0.8.0 \
+  --image ghcr.io/nvidia/aicr:v0.19.0 \
   --job-name snapshot-gpu-nodes \
   --service-account-name aicr \
   --node-selector accelerator=nvidia-h100 \
@@ -1003,6 +1003,8 @@ Validation can be run in different phases to validate different aspects of the d
 
 > **Note:** Readiness constraints (K8s version, OS, kernel) are always evaluated implicitly before any phase runs. If readiness fails, validation stops before deploying any Jobs and exits 2 (`INVALID_REQUEST`). This gate always fails closed — `--fail-on-error=false` scopes to phase check results and does not downgrade a readiness failure.
 >
+> **Declared-check pre-flight:** Every check named under a phase's `checks` list must resolve to exactly one catalog validator in that phase. Before any Job is deployed, `validate` fails closed with exit 2 (`INVALID_REQUEST`) if a declared check matches no validator (a typo, or a check missing from the loaded `--data` catalog), exists only under a different phase, or is declared more than once — reporting every offender at once. This runs in `--no-cluster` mode too, and like readiness it is independent of `--fail-on-error`. It replaces the previous warn-and-continue behavior, which let a phase with only unresolved checks report `skipped` and exit `0`.
+>
 > **Version skew:** Snapshots and recipes record the `aicr` version that produced them. When the recipe, the snapshot, and the running binary report different release versions, `validate` logs a single advisory warning (`version skew detected across validate inputs`) naming all three. This is a debugging breadcrumb — mixing artifacts from different versions can surface as confusing failures — and does **not** fail the command. Dev (`dev`) and pre-release (`-next`) builds are ignored to avoid noise.
 >
 > **apiVersion gate:** Snapshots and catalog artifacts use `aicr.run/v1alpha2`;
@@ -1027,6 +1029,13 @@ Constraints use fully qualified measurement paths: `{Type}.{Subtype}.{Key}`
 | `OS.release.VERSION_ID` | OS version (24.04, 22.04) |
 | `OS.sysctl./proc/sys/kernel/osrelease` | Kernel version |
 | `GPU.hardware.model` | GPU model (e.g. `h100`, `l40s`) |
+
+Constraint paths are validated against the measurement catalog when recipe data
+is loaded, so a typo such as `K8s.server.verison` fails immediately — naming the
+file, the field, and the nearest matching key — instead of silently evaluating
+as a missing reading. See
+[Recipe Development › Constraints](../integrator/recipe-development.md) for the
+addressing rules.
 
 Supported operators:
 
@@ -1294,7 +1303,7 @@ Results are output in CTRF (Common Test Report Format) — an industry-standard 
 | Code | Description |
 |------|-------------|
 | `0` | All phases passed or were skipped (also returned under `--fail-on-error=false` even when phases report `failed`/`other`) |
-| `2` | Invalid input (bad flags, missing recipe), or a readiness pre-flight constraint not met — the readiness gate always fails closed here regardless of `--fail-on-error` |
+| `2` | Invalid input (bad flags, missing recipe), a readiness pre-flight constraint not met, or a declared check that does not resolve to exactly one catalog validator in its phase (unmatched, cross-phase, or duplicate) — these pre-flight gates always fail closed here regardless of `--fail-on-error` |
 | `5` | Timeout (validator section or context deadline exceeded) |
 | `8` | One or more phase checks reported `failed` or `other` (crash/OOM/deadline) — when `--fail-on-error` is set |
 
@@ -1871,7 +1880,7 @@ The `--vendor-charts` flag pulls upstream Helm chart bytes into the bundle at bu
 my-bundle/
   001-gpu-operator/
     Chart.yaml                     # wrapper, declares the vendored subchart
-    charts/gpu-operator-v25.3.0.tgz # vendored upstream tarball
+    charts/gpu-operator-v26.3.3.tgz # vendored upstream tarball
     values.yaml                    # values nested under the subchart name
     cluster-values.yaml            # dynamic values, also nested
     install.sh                     # helm upgrade --install <name> ./<dir> ...
@@ -1895,10 +1904,10 @@ kind: BundleProvenance
 vendoredCharts:
   - name: gpu-operator
     chart: gpu-operator
-    version: v25.3.0
+    version: v26.3.3
     repository: https://helm.ngc.nvidia.com/nvidia
     sha256: abc123...
-    tarballName: gpu-operator-v25.3.0.tgz
+    tarballName: gpu-operator-v26.3.3.tgz
     pullerVersion: helm-cli v3.20.2
 ```
 
@@ -2132,7 +2141,7 @@ bundles/
 
 Manifest-only components and mixed-component raw manifests are supported by `--deployer argocd-helm` via the path-based Application shape.
 
-`static/` holds per-component values for upstream-helm Applications only. A recipe whose components are all local charts — the OpenShift overlays, for example — contributes no such files, and the directory is omitted from the bundle entirely rather than emitted empty.
+`static/` holds per-component values for upstream-helm Applications only. A recipe whose components are all local charts contributes no such files, and the directory is omitted from the bundle entirely rather than emitted empty. Most OpenShift (OCP) overlay components are local charts (OLM installer + CR pairs), but a few — components with no certified OCP operator, such as `prometheus-adapter-ocp` and `nvidia-dra-driver-gpu-ocp` — reuse their upstream Helm chart and do contribute a `static/` values file.
 
 **The bundle's `repoURL` defaults to the registry it was pushed to.** No `--repo` flag is needed (and is ignored if passed with `--deployer argocd-helm`). When pushed to an OCI registry, the parent namespace is baked into `values.yaml` as the default `repoURL` — a plain `helm install` works with no `--set repoURL` needed. Override with `--set repoURL=oci://mirror` when deploying from a different registry.
 **Recommended deploy flow:**
