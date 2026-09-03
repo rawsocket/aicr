@@ -51,6 +51,7 @@ func TestCompute_Structure(t *testing.T) {
 		{"eks", "rtx-pro-6000", "generic", "", "nvidia-tuned"},
 		{"gke", "a100", "h100", "", "nvidia-tuning-gke"},
 		{"gke", "b200", "-", "", "nvidia-tuning-gke"},
+		{"gke", "gb300", "gb200", "", "nvidia-tuning-gke"},
 		{"gke", "h100", "-", "", "nvidia-tuning-gke"},
 	}
 	if len(report.Rows) != len(want) {
